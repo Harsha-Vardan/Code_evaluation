@@ -13,6 +13,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #endif
 
 // Helper to compare files
@@ -98,16 +101,79 @@ ExecutionResult Executor::Execute(const std::string& executable,
     }
 
 #else
-    // Linux Implementation Placeholder
-    std::string command = executable + " < " + inputFile + " > " + actualOutputFile;
-    int exitCode = std::system(command.c_str());
-    
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    double timeTaken = elapsed.count();
-    
-    if (timeTaken * 1000 > timeLimitMs) return {"TLE", timeTaken, "Time Limit Exceeded"};
-    if (exitCode != 0) return {"RE", timeTaken, "Runtime Error"};
+    // Linux Implementation using fork/exec and setrlimit
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        return {"RE", 0, "Failed to fork process"};
+    }
+
+    if (pid == 0) {
+        // Child Process
+        
+        // Redirect stdin
+        int inFd = open(inputFile.c_str(), O_RDONLY);
+        if (inFd == -1) exit(1);
+        dup2(inFd, STDIN_FILENO);
+        close(inFd);
+
+        // Redirect stdout
+        int outFd = open(actualOutputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (outFd == -1) exit(1);
+        dup2(outFd, STDOUT_FILENO);
+        close(outFd);
+
+        // Set memory limit (example: 128MB)
+        struct rlimit memLimit;
+        memLimit.rlim_cur = 128 * 1024 * 1024;
+        memLimit.rlim_max = 128 * 1024 * 1024;
+        setrlimit(RLIMIT_AS, &memLimit);
+
+        // Execute user program
+        char* args[] = {(char*)executable.c_str(), NULL};
+        execv(args[0], args);
+        exit(1); // Should not reach here
+    } else {
+        // Parent Process
+        int status;
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        // Wait with a watchdog or use waitpid with WNOHANG in a loop
+        // Simple approach: sleep and check
+        int totalWaitMs = 0;
+        bool finished = false;
+        while (totalWaitMs < timeLimitMs) {
+            pid_t result = waitpid(pid, &status, WNOHANG);
+            if (result == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                totalWaitMs += 10;
+            } else if (result == pid) {
+                finished = true;
+                break;
+            } else {
+                return {"RE", 0, "Waitpid error"};
+            }
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        double timeTaken = elapsed.count();
+
+        if (!finished) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0); // Cleanup zombie
+            return {"TLE", timeTaken, "Time Limit Exceeded"};
+        }
+
+        if (WIFEXITED(status)) {
+            int exitCode = WEXITSTATUS(status);
+            if (exitCode != 0) {
+                return {"RE", timeTaken, "Runtime Error (Exit Code: " + std::to_string(exitCode) + ")"};
+            }
+        } else {
+            return {"RE", timeTaken, "Program terminated abnormally"};
+        }
+    }
 #endif
 
     if (compareFiles(actualOutputFile, expectedOutputFile)) {
